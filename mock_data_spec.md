@@ -6,8 +6,17 @@
 ## 1. Overview
 
 Synthetic beverage-retail dataset for a cashflow forecasting ML model.  
-Real customer and product data already exist in `hack2build.bronze` and are **read-only inputs** — do not regenerate them.  
-All generated tables land in `hack2build.bronze_mock`.
+Real customer and product data live in `h2b_bdc_*` catalogs and are **read-only inputs** — do not regenerate them.
+
+**Catalog conventions:**
+
+| Type | Pattern | Example |
+|------|---------|---------|
+| BDC source data (read-only) | `h2b_bdc_{entity}.{entity}.{table}` | `h2b_bdc_customer.customer.customer` |
+| Weather mock (mimics BDC source) | `h2b_bdc_weather.weather.weather` | — |
+| Generated mock data (DBX side) | `h2b_dbx_{entity}.{entity}.{table}` | `h2b_dbx_salesorder.salesorder.salesorder` |
+
+> Table names use no underscores: `salesorder`, `salesorderitem`, `billingdocument`, etc.
 
 ### Generation order (strict — never generate a child before its parent)
 
@@ -39,8 +48,11 @@ All generated tables land in `hack2build.bronze_mock`.
 | Window | Start | End | Months |
 |--------|-------|-----|--------|
 | Training | `2023-01-01` | `2025-12-31` | 36 |
+| Test | `2026-01-01` | `2026-06-30` | 6 |
 | Forecast | `2026-01-01` | `2026-06-30` | 6 |
 | Weather | `2023-01-01` | `2026-06-30` | 42 |
+
+**ML assumption:** 36 months of historical transactional data (2023–2025) train the cashflow forecasting model. The 6-month test window (Jan–Jun 2026) shares the same timeframe as the forecast — generated actuals for that period are used to evaluate model performance against the naive seasonal baseline produced in S4.
 
 ---
 
@@ -48,16 +60,26 @@ All generated tables land in `hack2build.bronze_mock`.
 
 ```python
 # Products — filter to these 6 only
-spark.table("hack2build.bronze.product")
+spark.table("h2b_bdc_product.product.product")
     .filter(col("Product").isin([
         'TG11','TG12','FPP','RTE','CM-FL-V00','CM-MLFL-KM-VXX']))
 
-# Customers — filter to these 10 only
-spark.table("hack2build.bronze.customer_sales_area")
+# Customer sales area — filter to these 10 only
+spark.table("h2b_bdc_customer.customer.customersalesarea")
     .filter(col("Customer").isin([
         '10100006','10100002','12200001',
         '10100012','10186001','10186002','10186003',
         'EWM10-CU01','EWM10-CU02','EWM10-CU03']))
+# if multiple rows per customer take DistributionChannel='10' as default
+
+# Customer geo
+spark.table("h2b_bdc_customer.customer.customer")
+    .filter(col("Customer").isin([...same 10...]))
+
+# Customer dunning (used in S4)
+spark.table("h2b_bdc_customer.customer.customerdunning")
+    .filter(col("Customer").isin([...same 10...]))
+# default DunningLevel=0 if customer not found
 ```
 
 ---
@@ -75,10 +97,20 @@ spark.table("hack2build.bronze.customer_sales_area")
 
 **Seasonal weight per group:**
 - L001 (TG11, TG12): +40% Jul–Aug · +20% Oct–Nov · −20% Jan–Feb
-- L004 (CM-FL-V00, CM-MLFL-KM-VXX): +20% Jul–Aug · +10% Oct–Nov · −10% Jan–Feb
-- P001 (FPP, RTE): capped at ±5% (flat profile)
+- L004 (CM-FL-V00, CM-MLFL-KM-VXX): half the L001 swing (+20% Jul–Aug · +10% Oct–Nov · −10% Jan–Feb)
+- P001 (FPP, RTE): 5% of L001 swing (nearly flat)
 
-**Variable prices** Price surges 5% to 10% Sep-Dec (random anomaly for 2 random pics only 1 for P001 and other for CM-MLFL-KM-VXX) due to a cost constraint assumption and 5% Jul - Aug due to seasonal peak (summer) for all material groups except P001.
+**Variable prices:**
+- +5% Jul–Aug for all groups except P001 (summer peak)
+- +5–10% Sep–Dec for 2 designated SKUs only: 1 randomly picked from P001 + CM-MLFL-KM-VXX (drawn once at seed=42, reused every order)
+
+**Fixed base prices** — drawn once with seed=42, reused for every order:
+
+| Material(s) | Range |
+|-------------|-------|
+| TG11, TG12 | Uniform(8.0, 18.0) EUR |
+| FPP, RTE | Uniform(5.0, 12.0) EUR |
+| CM-FL-V00, CM-MLFL-KM-VXX | Uniform(15.0, 35.0) EUR |
 
 ---
 
@@ -96,6 +128,8 @@ spark.table("hack2build.bronze.customer_sales_area")
 | `EWM10-CU01` | C | 1× | 2–15 | Normal(65, 20) | 0.80–0.92 |
 | `EWM10-CU02` | C | 1× | 2–15 | Normal(65, 20) | 0.80–0.92 |
 | `EWM10-CU03` | C | 1× | 2–15 | Normal(65, 20) | 0.80–0.92 |
+
+> Tier map is hardcoded — do not rely on `CustomerABCClassification`.
 
 **Revenue distribution:** A ≈ 91% (~30% each) · B ≈ 9% (~2.2% each) · C < 0.1% each
 
@@ -116,12 +150,12 @@ spark.table("hack2build.bronze.customer_sales_area")
 ## 7. Order quantity formula
 
 ```python
-OrderQuantity = round(
+OrderQuantity = max(1, round(
     base_qty(tier)
     × seasonal_weight(month, year, material_group)
     × weather_mult(avg_temp_c, temp_anomaly_c, material_group)
     × lognormal(0, 0.10)          # noise — σ kept low to preserve weather signal
-)  # minimum 1
+))
 
 # base_qty
 A-tier: Uniform(200, 800)
@@ -141,7 +175,7 @@ if material_group == 'P001':
 base *= (1 + 0.03 * (year - 2023))        # YoY growth
 
 # weather_mult
-# Look up WeatherNOAA for (customer.Country, customer.Region, year, month)
+# Lookup: h2b_bdc_weather.weather.weather for (customer.Country, customer.Region, year, month)
 # Default (10.0°C, 0.0 anomaly) if region not found
 mult = 1.0
 if avg_temp_c > 22:
@@ -171,21 +205,21 @@ The 2025 normal summer validates the model doesn't over-forecast in the absence 
 
 ## 9. Volume targets
 
-| Table | Estimated rows |
-|-------|---------------|
-| `sales_order` | ~5,000 |
-| `sales_order_item` | ~12,500 |
-| `billing_document` | ~3,500 |
-| `billing_document_item` | ~9,000 |
-| `weather_noaa` | 210 |
-| `cash_flow` | ~3,150 |
-| `cash_flow_forecast` | ~181 |
+| Table | Catalog path | ~Rows |
+|-------|-------------|-------|
+| `weather` | `h2b_bdc_weather.weather.weather` | 210 |
+| `salesorder` | `h2b_dbx_salesorder.salesorder.salesorder` | ~5,000 |
+| `salesorderitem` | `h2b_dbx_salesorder.salesorder.salesorderitem` | ~12,500 |
+| `billingdocument` | `h2b_dbx_billingdocument.billingdocument.billingdocument` | ~3,500 |
+| `billingdocumentitem` | `h2b_dbx_billingdocument.billingdocument.billingdocumentitem` | ~9,000 |
+| `cashflow` | `h2b_dbx_cashflow.cashflow.cashflow` | ~3,150 |
+| `cashflowforecast` | `h2b_dbx_cashflow.cashflow.cashflowforecast` | ~181 |
 
 ---
 
 ## 10. Prompts
 
-Run each prompt in a separate Databricks notebook cell in the order shown.
+Run each prompt in a separate Databricks notebook in the order shown.
 
 ---
 
@@ -201,7 +235,7 @@ Output: 5 regions × 42 months = 210 rows.
 Columns: station_id, station_name, country, region, year, month,
          avg_temp_c, temp_anomaly_c, precipitation_mm, extreme_heat_flag
 
-Regions — must match hack2build.bronze.customer Country + Region exactly:
+Regions — must match h2b_bdc_customer.customer.customer Country + Region exactly:
   NOAA_DE_BY  → country='DE', region='BY'
   NOAA_DE_NW  → country='DE', region='NW'
   NOAA_FR_IDF → country='FR', region='IDF'
@@ -239,8 +273,7 @@ precipitation_mm:
 Join key to orders:
   customer.Country + customer.Region + year(CreationDate) + month(CreationDate)
 
-Write to hack2build.bronze_mock.weather_noaa as Delta table.
-Print row count and 5-row sample grouped by region.
+Write to h2b_bdc_weather.weather.weather as Delta table.
 ```
 
 ---
@@ -253,13 +286,13 @@ returning {'SalesOrder': df1, 'SalesOrderItem': df2}. Use seed=42.
 
 READ AT THE START (do not mock these):
 
-  products_df = spark.table("hack2build.bronze.product") \
+  products_df = spark.table("h2b_bdc_product.product.product") \
       .filter(col("Product").isin([
           'TG11','TG12','FPP','RTE','CM-FL-V00','CM-MLFL-KM-VXX']))
   # columns needed: Product, ProductGroup, ProductHierarchy,
   #                 CrossPlantStatus, ProductExternalID
 
-  customer_area_df = spark.table("hack2build.bronze.customer_sales_area") \
+  customer_area_df = spark.table("h2b_bdc_customer.customer.customersalesarea") \
       .filter(col("Customer").isin([
           '10100006','10100002','12200001','10100012',
           '10186001','10186002','10186003',
@@ -268,11 +301,11 @@ READ AT THE START (do not mock these):
   #          IncotermsClassification, Currency, CustomerGroup
   # if multiple rows per customer take DistributionChannel='10' as default
 
-  customer_geo_df = spark.table("hack2build.bronze.customer") \
+  customer_geo_df = spark.table("h2b_bdc_customer.customer.customer") \
       .filter(col("Customer").isin([...same 10...]))
   # columns: Customer, Country, Region
 
-  weather_df = spark.table("hack2build.bronze_mock.weather_noaa")
+  weather_df = spark.table("h2b_bdc_weather.weather.weather")
   # Build lookup dict: {(country, region, year, month): (avg_temp_c, temp_anomaly_c)}
 
 HARDCODED TIER MAP (use this — do not rely on CustomerABCClassification):
@@ -342,29 +375,11 @@ Rules:
 - Plant: 'PLANT1' if DistributionChannel='10' / 'PLANT2' if '20'
 - MaterialGroup: from products_df.ProductGroup
 - ProductHierarchyNode: from products_df.ProductHierarchy
-- OrderQuantity (integer, minimum 1):
-    step 1 — base_qty:
-      A: Uniform(200, 800)  B: Uniform(40, 180)  C: Uniform(2, 15)
-    step 2 — seasonal_weight:
-      L001: 1.0 + offsets above + 0.03*(year-2023) growth
-      L004: 1.0 + (L001 offset) * 0.50 + 0.03*(year-2023)
-      P001: 1.0 + (L001 offset) * 0.05 + 0.03*(year-2023)
-    step 3 — weather_mult:
-      (country, region) = customer_geo_df lookup for SoldToParty
-      (avg_t, anom) = weather_lookup.get((country, region, year, month), (10.0, 0.0))
-      mult = 1.0
-      if avg_t > 22: mult += 0.50 * min((avg_t - 22) / 5, 1.0)
-      if avg_t > 25: mult += 0.30
-      mult += 0.20 * max(0, anom)
-      mult = min(mult, 3.0)
-      if material_group == 'P001': mult = 1.0 + (mult - 1.0) * 0.30
-    step 4:
-      OrderQuantity = max(1, round(base_qty * seasonal_weight * weather_mult
-                                    * lognormal(0, 0.10)))
+- OrderQuantity (integer, minimum 1): see section 7
 - OrderQuantityUnit: 'CS'
 - RequestedQuantity: max(OrderQuantity+1, round(OrderQuantity * Uniform(1.05, 1.15)))
 - RequestedQuantityUnit: 'CS'
-- NetPriceAmount: from FIXED PRICE MAP
+- NetPriceAmount: from FIXED PRICE MAP (with seasonal surges applied)
 - NetAmount: OrderQuantity × NetPriceAmount
 - TaxAmount: NetAmount × 0.19 if Currency='EUR' / 0.0 if 'USD'
 - SalesOrderItemCategory: 'TAN' 95% / 'TANN' 5%
@@ -380,8 +395,8 @@ After all items are generated:
   back-fill SalesOrder.TotalNetAmount = SUM(SalesOrderItem.NetAmount) per SalesOrder
 
 Write to:
-  hack2build.bronze_mock.sales_order
-  hack2build.bronze_mock.sales_order_item
+  h2b_dbx_salesorder.salesorder.salesorder
+  h2b_dbx_salesorder.salesorder.salesorderitem
 ```
 
 ---
@@ -391,6 +406,10 @@ Write to:
 ```
 Generate `generate_billing_tables(sales_order_df, sales_order_item_df)`
 returning {'BillingDocument': df1, 'BillingDocumentItem': df2}. Use seed=42.
+
+READ AT THE START:
+  sales_order_df      = spark.table("h2b_dbx_salesorder.salesorder.salesorder")
+  sales_order_item_df = spark.table("h2b_dbx_salesorder.salesorder.salesorderitem")
 
 Source orders: SalesOrders where OverallSDProcessStatus IN ('B','C')
                AND OverallSDDocumentRejectionSts != 'C'
@@ -450,8 +469,8 @@ Rules:
     NetAmount, GrossAmount, TaxAmount = negated values of originals
 
 Write to:
-  hack2build.bronze_mock.billing_document
-  hack2build.bronze_mock.billing_document_item
+  h2b_dbx_billingdocument.billingdocument.billingdocument
+  h2b_dbx_billingdocument.billingdocument.billingdocumentitem
 ```
 
 ---
@@ -463,7 +482,9 @@ Generate `generate_cashflow_tables(billing_df, forecast_months=6)`
 returning {'CashFlow': df1, 'CashFlowForecast': df2}. Use seed=42.
 
 READ AT THE START:
-  customer_dunning_df = spark.table("hack2build.bronze.customer_dunning") \
+  billing_df = spark.table("h2b_dbx_billingdocument.billingdocument.billingdocument")
+
+  customer_dunning_df = spark.table("h2b_bdc_customer.customer.customerdunning") \
       .filter(col("Customer").isin([
           '10100006','10100002','12200001','10100012',
           '10186001','10186002','10186003',
@@ -533,8 +554,8 @@ Generation — naive seasonal baseline (intentionally imperfect, ML model must b
     TransactionDate = PostingDate, CompanyCode = 'CC01', TransactionCurrency = 'EUR'
 
 Write to:
-  hack2build.bronze_mock.cash_flow
-  hack2build.bronze_mock.cash_flow_forecast
+  h2b_dbx_cashflow.cashflow.cashflow
+  h2b_dbx_cashflow.cashflow.cashflowforecast
 ```
 
 ---
@@ -542,12 +563,18 @@ Write to:
 ### Final assembly prompt
 
 ```
-Write `main()` that orchestrates all 4 generation functions.
+Write `main()` that orchestrates all 4 generation functions in strict order.
 Use seed=42 everywhere.
 
-STEP 1 — create schema:
-  spark.sql("CREATE CATALOG IF NOT EXISTS hack2build")
-  spark.sql("CREATE SCHEMA IF NOT EXISTS hack2build.bronze_mock")
+STEP 1 — create catalogs and schemas as needed:
+  spark.sql("CREATE CATALOG IF NOT EXISTS h2b_bdc_weather")
+  spark.sql("CREATE SCHEMA  IF NOT EXISTS h2b_bdc_weather.weather")
+  spark.sql("CREATE CATALOG IF NOT EXISTS h2b_dbx_salesorder")
+  spark.sql("CREATE SCHEMA  IF NOT EXISTS h2b_dbx_salesorder.salesorder")
+  spark.sql("CREATE CATALOG IF NOT EXISTS h2b_dbx_billingdocument")
+  spark.sql("CREATE SCHEMA  IF NOT EXISTS h2b_dbx_billingdocument.billingdocument")
+  spark.sql("CREATE CATALOG IF NOT EXISTS h2b_dbx_cashflow")
+  spark.sql("CREATE SCHEMA  IF NOT EXISTS h2b_dbx_cashflow.cashflow")
 
 STEP 2 — call generation functions in strict order:
   weather   = generate_weather_table(reference_date='2023-01-01', months=42)
@@ -555,39 +582,30 @@ STEP 2 — call generation functions in strict order:
   billing   = generate_billing_tables(orders['SalesOrder'], orders['SalesOrderItem'])
   cashflows = generate_cashflow_tables(billing['BillingDocument'], forecast_months=6)
 
-STEP 3 — write all tables (all functions already write internally,
-  but confirm each table exists):
+STEP 3 — confirm each table exists and print row count + 3-row sample:
   TABLE_MAP = {
-      'weather_noaa':              weather['WeatherNOAA'],
-      'sales_order':               orders['SalesOrder'],
-      'sales_order_item':          orders['SalesOrderItem'],
-      'billing_document':          billing['BillingDocument'],
-      'billing_document_item':     billing['BillingDocumentItem'],
-      'cash_flow':                 cashflows['CashFlow'],
-      'cash_flow_forecast':        cashflows['CashFlowForecast'],
+      'h2b_bdc_weather.weather.weather':                              weather['WeatherNOAA'],
+      'h2b_dbx_salesorder.salesorder.salesorder':                    orders['SalesOrder'],
+      'h2b_dbx_salesorder.salesorder.salesorderitem':                orders['SalesOrderItem'],
+      'h2b_dbx_billingdocument.billingdocument.billingdocument':     billing['BillingDocument'],
+      'h2b_dbx_billingdocument.billingdocument.billingdocumentitem': billing['BillingDocumentItem'],
+      'h2b_dbx_cashflow.cashflow.cashflow':                          cashflows['CashFlow'],
+      'h2b_dbx_cashflow.cashflow.cashflowforecast':                  cashflows['CashFlowForecast'],
   }
-  for name, df in TABLE_MAP.items():
-      df.write.format("delta") \
-        .mode("overwrite") \
-        .option("overwriteSchema", "true") \
-        .saveAsTable(f"hack2build.bronze_mock.{name}")
 
 STEP 4 — integrity validation (print all results):
 
-  a. SalesOrder.SoldToParty not in known 10 customers             → expect 0
+  a. SalesOrder.SoldToParty not in known 10 customers                  → expect 0
   b. SalesOrderItem.Material not in
-     ['TG11','TG12','FPP','RTE','CM-FL-V00','CM-MLFL-KM-VXX']    → expect 0
+     ['TG11','TG12','FPP','RTE','CM-FL-V00','CM-MLFL-KM-VXX']         → expect 0
   c. SalesOrderItem with Material='CM-MLFL-KM-VXX'
-     AND parent CreationDate >= '2025-06-01'                       → expect 0
-  d. BillingDocument.PayerParty not in known 10 customers          → expect 0
-  e. CashFlow.PostingDate < BillingDocument.BillingDocumentDate    → expect 0
+     AND parent CreationDate >= '2025-06-01'                           → expect 0
+  d. BillingDocument.PayerParty not in known 10 customers              → expect 0
+  e. CashFlow.PostingDate < BillingDocument.BillingDocumentDate        → expect 0
   f. WeatherNOAA: mean temp_anomaly_c where year=2023, month IN (7,8),
-     region IN ('BY','NW')                                         → expect > 2.0°C
+     region IN ('BY','NW')                                             → expect > 2.0°C
   g. WeatherNOAA: mean temp_anomaly_c where year=2024, month IN (7,8),
-     region IN ('BY','NW')                                         → expect > 2.5°C
+     region IN ('BY','NW')                                             → expect > 2.5°C
   h. SalesOrderItem: mean(OrderQuantity) for Jul-Aug 2023 vs Jul-Aug 2025
-     (L001+L004 materials only)                                    → expect 2023 ~40-70% higher
-
-STEP 5 — print for each table:
-  full table name, row count, column list, 3-row sample
+     (L001+L004 materials only)                                        → expect 2023 ~40-70% higher
 ```
