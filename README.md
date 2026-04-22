@@ -1,11 +1,58 @@
-# Hack2Build — Databricks PoC
-**SAP BDC Cashflow Forecasting · Synthetic Data Pipeline**
+# Hack2Build — SAP BDC Cashflow Forecasting PoC
 
-Databricks notebooks that generate a fully synthetic beverage-retail dataset for training and evaluating a cashflow forecasting ML model. Real master data (customers, products) is read from existing BDC catalogs and is never regenerated.
+## Executive Summary
+
+This proof of concept demonstrates how a beverage distributor can predict cashflow 6 months ahead by connecting customer order behaviour to weather signals. Using SAP BDC as the source of truth for master data, we generate a realistic synthetic transaction history, train a forecasting model, and compare its predictions against known actuals — giving a clear, quantified view of forecast accuracy before any production investment is made.
+
+**Business question:** Can we predict monthly cashflow with enough accuracy to replace reactive cash management with a forward-looking plan?
+
+**Expected outcome:** A model that outperforms the naive seasonal baseline on a 6-month held-out test window, with results presented as predicted vs. actual cashflow per period and product.
 
 ---
 
-## Repository structure
+## Business Briefing
+
+### What we are forecasting
+
+Cashflow for a beverage distributor is driven primarily by when customers pay for orders. Payment timing depends on the customer relationship (credit terms, dunning history), the volume of goods ordered, and the price of those goods. Volume, in turn, is influenced by the season and — critically for beverages — by temperature. Hot summers drive outsized demand for cooling drinks.
+
+This PoC encodes that logic end-to-end: from a heat wave in Germany to a spike in sales orders, through to cash hitting the account weeks later.
+
+### The demand signal
+
+Three customer tiers cover the full range of the distributor's book:
+
+| Tier | Profile | Revenue share |
+|------|---------|---------------|
+| A | 3 large accounts, high volume, fast payers | ~91% |
+| B | 4 mid-size accounts, moderate volume | ~9% |
+| C | 3 small accounts, low volume, slower payers | <1% |
+
+The synthetic history runs from January 2023 through June 2026 — 36 months of training data followed by a 6-month test window that mirrors the live forecast horizon.
+
+### The weather signal
+
+Two consecutive above-average summers (Germany, 2023 and 2024) create a strong, unambiguous demand signal. A normal 2025 summer validates that the model does not over-forecast when the heat wave is absent. This three-year pattern gives the model clear evidence to learn from before it is asked to predict 2026.
+
+### How performance is measured
+
+Model predictions for January–June 2026 are compared directly against the generated actuals for the same period. The benchmark is the naive seasonal baseline — if the model cannot beat a simple year-over-year repeat, it adds no value. Results are published to a dedicated results catalog as predicted vs. actual cashflow per period and material, with delta and relative error.
+
+### Current pipeline status
+
+| Step | Deliverable | Status |
+|------|------------|--------|
+| S1 | Synthetic weather data (5 regions, 42 months) | Done |
+| S2 | Sales orders + order items (7,000 orders, 42 months) | Done |
+| S3 | Billing documents + billing document items | Pending |
+| S4 | Cashflow records | Pending |
+| ML | Feature engineering, model training, forecast | Pending |
+
+---
+
+## Technical Briefing
+
+### Repository structure
 
 ```
 mock_data_spec.md          ← full generation spec (source of truth)
@@ -16,9 +63,9 @@ mock_data/
 
 ---
 
-## Data generation overview
+### Data generation overview
 
-### Timeline
+#### Timeline
 
 | Window | Period | Months | Purpose |
 |--------|--------|--------|---------|
@@ -30,7 +77,7 @@ The test window shares the same timeframe as the forecast — generated actuals 
 
 ---
 
-### Catalog conventions
+#### Catalog conventions
 
 | Data type | Catalog pattern | Example |
 |-----------|----------------|---------|
@@ -44,7 +91,7 @@ Table names contain no underscores (`salesorderitem`, `billingdocument`, etc.).
 
 ---
 
-### BDC → DBX data cloning
+#### BDC → DBX data cloning
 
 Before populating any DBX catalog with mock data, the schema structure is cloned from its BDC counterpart using the Databricks SDK. This ensures the DBX tables inherit the correct column definitions from the BDC Delta Share.
 
@@ -79,7 +126,7 @@ This clone-then-truncate pattern means:
 
 ---
 
-### Volume targets
+#### Volume targets
 
 | Table | Catalog path | ~Rows |
 |-------|-------------|-------|
@@ -92,9 +139,9 @@ This clone-then-truncate pattern means:
 
 ---
 
-## How the data is generated
+### How the data is generated
 
-### S1 — WeatherNOAA
+#### S1 — WeatherNOAA
 
 Five regional stations covering the customer base geography:
 
@@ -122,11 +169,11 @@ Two consecutive above-baseline summers give the model a strong, unambiguous sign
 
 ---
 
-### S2 — SalesOrder + SalesOrderItem
+#### S2 — SalesOrder + SalesOrderItem
 
 **7,000 orders** distributed across 42 months (~167/month average). Order density follows a seasonal weight so more orders fall in peak months naturally.
 
-#### Customer tiers
+##### Customer tiers
 
 | Tier | Customers | Order weight | Qty range (CS) |
 |------|-----------|-------------|----------------|
@@ -136,7 +183,7 @@ Two consecutive above-baseline summers give the model a strong, unambiguous sign
 
 Revenue split: A ≈ 91% · B ≈ 9% · C < 0.1%. Tier map is hardcoded — not derived from `CustomerABCClassification`.
 
-#### Order quantity formula
+##### Order quantity formula
 
 Each item quantity is the product of four factors:
 
@@ -149,7 +196,7 @@ OrderQty = max(1, round(base_qty × seasonal_weight × weather_mult × lognormal
 3. **weather_mult** — temperature ramp above 22 °C up to +80% at 27 °C, with an additional bonus for positive anomalies (heat waves); capped at 3×
 4. **lognormal noise** — σ=0.10, kept low to preserve the weather signal
 
-#### Materials
+##### Materials
 
 | Material | Group | Seasonal profile | Price EUR/CS | Status |
 |----------|-------|-----------------|--------------|--------|
@@ -160,7 +207,7 @@ OrderQty = max(1, round(base_qty × seasonal_weight × weather_mult × lognormal
 
 Base prices are drawn once at seed=42 and reused for every order. Seasonal surges are applied on top: +5% Jul–Aug (non-P001), and +5–10% Sep–Dec for two designated SKUs (one P001, CM-MLFL-KM-VXX).
 
-#### Order date distribution
+##### Order date distribution
 
 Creation dates are allocated month-by-month using:
 ```
@@ -170,7 +217,7 @@ where seasonal_offset is +0.40 Jul–Aug, +0.20 Oct–Nov, −0.20 Jan–Feb, 0 
 
 ---
 
-### S3 — BillingDocument + BillingDocumentItem
+#### S3 — BillingDocument + BillingDocumentItem
 
 One billing document is created per **eligible** sales order — those with `OverallSDProcessStatus ∈ {B, C}` and no rejection (`OverallSDDocumentRejectionSts ≠ C`). That filter passes ~63% of orders (~4,410 of 7,000).
 
@@ -180,7 +227,7 @@ Billing document date = `CreationDate + randint(3, 10)` days — this is the DSO
 
 ---
 
-### S4 — CashFlow
+#### S4 — CashFlow
 
 **CashFlow** — one record per non-cancelled F2 billing document (~3,969 rows). Payment amount is the billing total discounted by a tier-based collection rate and a dunning-level multiplier. Posting date is derived from:
 
@@ -194,7 +241,7 @@ PostingDate = BillingDocumentDate
 
 ---
 
-## ML catalog structure
+### ML catalog structure
 
 All ML artifacts live inside the same DBX entity catalog (`h2b_dbx_{entity}`) alongside the transactional data, organised into dedicated schemas.
 
@@ -231,7 +278,7 @@ The split is purely by date — there are no flag columns to distinguish trainin
 
 ---
 
-## Forecast results and actuals comparison
+### Forecast results and actuals comparison
 
 The `h2b_dbx_resultset` catalog is the outcome layer of the pipeline. It holds the side-by-side comparison of model predictions against generated actuals for the Jan–Jun 2026 test window.
 
@@ -245,11 +292,11 @@ h2b_dbx_resultset/
 - Model output from `h2b_dbx_salesorder.forecasts.*`
 - Actuals from `complete_agg` (filtered to 2026-01 → 2026-06)
 
-Expected columns include forecast value, actual value, delta, and relative error — giving a direct read on model performance vs the naive seasonal baseline produced in S4.
+Expected columns include forecast value, actual value, delta, and relative error — giving a direct read on model performance vs the naive seasonal baseline.
 
 ---
 
-## Relational integrity
+### Relational integrity
 
 ```
 WeatherNOAA ──(lookup)──► SalesOrderItem
@@ -293,7 +340,7 @@ BillingDocument (F2, not cancelled) ──1:1──► CashFlow
 
 ---
 
-## Key assumptions
+### Key assumptions
 
 | Assumption | Value / Rule |
 |------------|-------------|
@@ -307,3 +354,5 @@ BillingDocument (F2, not cancelled) ──1:1──► CashFlow
 | DSO cap | 180 days maximum |
 | Weather default | (10.0 °C, 0.0 anomaly) for unmapped regions |
 | Tier map | Hardcoded — do not use CustomerABCClassification |
+| Training window | 36 months (2023-01-01 → 2025-12-31) |
+| Test window | 6 months (2026-01-01 → 2026-06-30) — same as forecast horizon |
