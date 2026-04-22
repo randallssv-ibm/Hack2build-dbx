@@ -89,7 +89,6 @@ This clone-then-truncate pattern means:
 | `billingdocument` | `h2b_dbx_billingdocument.billingdocument.billingdocument` | ~4,851 |
 | `billingdocumentitem` | `h2b_dbx_billingdocument.billingdocument.billingdocumentitem` | ~12,600 |
 | `cashflow` | `h2b_dbx_cashflow.cashflow.cashflow` | ~3,969 |
-| `cashflowforecast` | `h2b_dbx_cashflow.cashflow.cashflowforecast` | ~181 |
 
 ---
 
@@ -181,7 +180,7 @@ Billing document date = `CreationDate + randint(3, 10)` days — this is the DSO
 
 ---
 
-### S4 — CashFlow + CashFlowForecast
+### S4 — CashFlow
 
 **CashFlow** — one record per non-cancelled F2 billing document (~3,969 rows). Payment amount is the billing total discounted by a tier-based collection rate and a dunning-level multiplier. Posting date is derived from:
 
@@ -192,8 +191,6 @@ PostingDate = BillingDocumentDate
             + noise                 ← Normal(0, 3)
             capped at 180 days, minimum 1 day after BillingDocumentDate
 ```
-
-**CashFlowForecast** — naive seasonal baseline for Jan–Jun 2026 (~181 rows, one per calendar day). Built from the ISO-week average of historical cash flows, scaled by a 4% growth assumption and Uniform(0.92, 1.08) noise. Intentionally imperfect — the ML model is expected to beat it.
 
 ---
 
@@ -277,8 +274,6 @@ BillingDocument ──1:N──► BillingDocumentItem
 BillingDocument (F2, not cancelled) ──1:1──► CashFlow
                                              ~90% of F2 docs produce a cash flow record
 
-CashFlowForecast ── standalone (no FK)
-                    one row per calendar day, Jan–Jun 2026
 ```
 
 #### Eligibility cascade

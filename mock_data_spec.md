@@ -25,7 +25,7 @@ Real customer and product data live in `h2b_bdc_*` catalogs and are **read-only 
 | S1 | WeatherNOAA | — |
 | S2 | SalesOrder + SalesOrderItem | real product, real customer, WeatherNOAA |
 | S3 | BillingDocument + BillingDocumentItem | S2 |
-| S4 | CashFlow + CashFlowForecast | S3 + real customer_dunning |
+| S4 | CashFlow | S3 + real customer_dunning |
 
 ---
 
@@ -213,7 +213,6 @@ The 2025 normal summer validates the model doesn't over-forecast in the absence 
 | `billingdocument` | `h2b_dbx_billingdocument.billingdocument.billingdocument` | ~3,500 |
 | `billingdocumentitem` | `h2b_dbx_billingdocument.billingdocument.billingdocumentitem` | ~9,000 |
 | `cashflow` | `h2b_dbx_cashflow.cashflow.cashflow` | ~3,150 |
-| `cashflowforecast` | `h2b_dbx_cashflow.cashflow.cashflowforecast` | ~181 |
 
 ---
 
@@ -478,8 +477,8 @@ Write to:
 ### Prompt 4 — CashFlow
 
 ```
-Generate `generate_cashflow_tables(billing_df, forecast_months=6)`
-returning {'CashFlow': df1, 'CashFlowForecast': df2}. Use seed=42.
+Generate `generate_cashflow_tables(billing_df)`
+returning {'CashFlow': df1}. Use seed=42.
 
 READ AT THE START:
   billing_df = spark.table("h2b_dbx_billingdocument.billingdocument.billingdocument")
@@ -537,25 +536,8 @@ Other fields:
   TransactionDate:              same as PostingDate
   CompanyCode:                  'CC01'
 
---- DataFrame 2: CashFlowForecast (~181 rows — 2026-01-01 to 2026-06-30) ---
-Columns: same as CashFlow minus BankAccountInternalID
-
-Generation — naive seasonal baseline (intentionally imperfect, ML model must beat this):
-  Step 1: weekly_avg = mean(CashFlow.AmountInCompanyCodeCurrency)
-          grouped by ISO week-of-year, over PostingDates in 2023–2025
-  Step 2: overall_mean = mean(weekly_avg values)
-  Step 3: for each day d in 2026-01-01 to 2026-06-30:
-            seasonal_index = weekly_avg[iso_week(d)] / overall_mean
-            forecast = (overall_mean / 7) × seasonal_index × 1.04 × Uniform(0.92, 1.08)
-  Step 4:
-    All currency amounts = forecast (EUR only)
-    CashFlowID:                'FCF-000001' sequential
-    CshFlwValdtyStrtDteTmeVal: same encoding
-    TransactionDate = PostingDate, CompanyCode = 'CC01', TransactionCurrency = 'EUR'
-
 Write to:
   h2b_dbx_cashflow.cashflow.cashflow
-  h2b_dbx_cashflow.cashflow.cashflowforecast
 ```
 
 ---
@@ -580,7 +562,7 @@ STEP 2 — call generation functions in strict order:
   weather   = generate_weather_table(reference_date='2023-01-01', months=42)
   orders    = generate_sales_order_tables(reference_date='2023-01-01', months=36)
   billing   = generate_billing_tables(orders['SalesOrder'], orders['SalesOrderItem'])
-  cashflows = generate_cashflow_tables(billing['BillingDocument'], forecast_months=6)
+  cashflows = generate_cashflow_tables(billing['BillingDocument'])
 
 STEP 3 — confirm each table exists and print row count + 3-row sample:
   TABLE_MAP = {
@@ -590,7 +572,6 @@ STEP 3 — confirm each table exists and print row count + 3-row sample:
       'h2b_dbx_billingdocument.billingdocument.billingdocument':     billing['BillingDocument'],
       'h2b_dbx_billingdocument.billingdocument.billingdocumentitem': billing['BillingDocumentItem'],
       'h2b_dbx_cashflow.cashflow.cashflow':                          cashflows['CashFlow'],
-      'h2b_dbx_cashflow.cashflow.cashflowforecast':                  cashflows['CashFlowForecast'],
   }
 
 STEP 4 — integrity validation (print all results):
