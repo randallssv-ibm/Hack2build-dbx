@@ -4,9 +4,7 @@
 
 This proof of concept demonstrates how a beverage distributor can predict cashflow 6 months ahead by connecting customer order behaviour to weather signals. Using SAP BDC as the source of truth for master data, we generate a realistic synthetic transaction history, train a forecasting model, and compare its predictions against known actuals — giving a clear, quantified view of forecast accuracy before any production investment is made.
 
-**Business question:** Can we predict monthly cashflow with enough accuracy to replace reactive cash management with a forward-looking plan?
 
-**Expected outcome:** A model that outperforms the naive seasonal baseline on a 6-month held-out test window, with results presented as predicted vs. actual cashflow per period and product.
 
 ---
 
