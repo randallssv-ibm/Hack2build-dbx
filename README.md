@@ -37,8 +37,45 @@ The test window shares the same timeframe as the forecast — generated actuals 
 | BDC source — read-only | `h2b_bdc_{entity}.{entity}.{table}` | `h2b_bdc_customer.customer.customer` |
 | Generated weather (mimics BDC source) | `h2b_bdc_weather.weather.weather` | — |
 | Generated mock transactions (DBX side) | `h2b_dbx_{entity}.{entity}.{table}` | `h2b_dbx_salesorder.salesorder.salesorder` |
+| ML feature datasets + models | `h2b_dbx_{entity}.featuredatasets / mlmodels / forecasts` | — |
+| Forecast results + actuals comparison | `h2b_dbx_resultset.resultset.{table}` | — |
 
 Table names contain no underscores (`salesorderitem`, `billingdocument`, etc.).
+
+---
+
+### BDC → DBX data cloning
+
+Before populating any DBX catalog with mock data, the schema structure is cloned from its BDC counterpart using the Databricks SDK. This ensures the DBX tables inherit the correct column definitions from the BDC Delta Share.
+
+```python
+from databricks.sdk import WorkspaceClient
+w = WorkspaceClient()
+
+# 1. Discover schemas and tables from the BDC catalog (Delta Share)
+schemas = [s.name for s in w.schemas.list(catalog_name="h2b_bdc_{entity}")
+           if s.name != "information_schema"]
+tables  = [(t.schema_name, t.name)
+           for s in schemas
+           for t in w.tables.list(catalog_name="h2b_bdc_{entity}", schema_name=s)]
+
+# 2. Mirror structure into the DBX catalog
+for schema, table in tables:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS h2b_dbx_{{entity}}.{schema}")
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS h2b_dbx_{{entity}}.{schema}.{table}
+        AS SELECT * FROM h2b_bdc_{{entity}}.{schema}.{table}
+    """)
+
+# 3. Truncate — ready to receive mock data
+for schema, table in tables:
+    spark.sql(f"TRUNCATE TABLE h2b_dbx_{{entity}}.{schema}.{table}")
+```
+
+This clone-then-truncate pattern means:
+- The DBX catalog has schema parity with the BDC source at generation time
+- Mock data is inserted into correctly typed tables
+- The BDC source is never written to
 
 ---
 
@@ -157,6 +194,61 @@ PostingDate = BillingDocumentDate
 ```
 
 **CashFlowForecast** — naive seasonal baseline for Jan–Jun 2026 (~181 rows, one per calendar day). Built from the ISO-week average of historical cash flows, scaled by a 4% growth assumption and Uniform(0.92, 1.08) noise. Intentionally imperfect — the ML model is expected to beat it.
+
+---
+
+## ML catalog structure
+
+All ML artifacts live inside the same DBX entity catalog (`h2b_dbx_{entity}`) alongside the transactional data, organised into dedicated schemas.
+
+```
+h2b_dbx_salesorder/
+├── salesorder/              ← transactional mock data
+│   ├── salesorder
+│   └── salesorderitem
+│
+├── featuredatasets/         ← engineered feature tables
+│   ├── train_agg            ← 2023-01-01 → 2025-12-31  used to train models
+│   ├── complete_agg         ← 2023-01-01 → 2026-06-30  train + test window combined
+│   │                           use this to compare predicted vs actual after the fact
+│   └── (material-level cuts, e.g. salesorders_tg11, salesorders_fpp …)
+│
+├── forecasts/               ← model output tables
+│   ├── forecast_salesorder_matlvl_weekly
+│   ├── forecast_salesorderquantity_material
+│   └── forecast_salesorderquantity_material_withid
+│
+└── mlmodels/                ← registered MLflow models
+    ├── forecast_model_{run_id}
+    └── forecast_salesorder_matlvl_weekly
+```
+
+#### Feature dataset purpose
+
+| Table | Rows cover | Purpose |
+|-------|-----------|---------|
+| `train_agg` | 2023-01 → 2025-12 (36 months) | Input to model training — no future leakage |
+| `complete_agg` | 2023-01 → 2026-06 (42 months) | Full series including test window; used post-prediction to compare forecast vs actuals |
+
+The split is purely by date — there are no flag columns to distinguish training from test rows. Consumers filter on the date range they need.
+
+---
+
+## Forecast results and actuals comparison
+
+The `h2b_dbx_resultset` catalog is the outcome layer of the pipeline. It holds the side-by-side comparison of model predictions against generated actuals for the Jan–Jun 2026 test window.
+
+```
+h2b_dbx_resultset/
+└── resultset/
+    └── forecast_results     ← predicted vs actual per period/material
+```
+
+**`forecast_results`** joins:
+- Model output from `h2b_dbx_salesorder.forecasts.*`
+- Actuals from `complete_agg` (filtered to 2026-01 → 2026-06)
+
+Expected columns include forecast value, actual value, delta, and relative error — giving a direct read on model performance vs the naive seasonal baseline produced in S4.
 
 ---
 
