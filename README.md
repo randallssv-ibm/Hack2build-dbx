@@ -1,5 +1,14 @@
 # Hack2Build — SAP BDC Cashflow Forecasting PoC
 
+## Known Issues & Pending
+
+| # | Area | Description | Priority |
+|---|------|-------------|----------|
+| 1 | Weather mock | `Weather Mock.ipynb` generates monthly grain (210 rows). ML model currently joins weather by year-month. Upgrade to weekly weather generation so regressors carry intra-month variation. | Medium |
+
+---
+
+
 ## Executive Summary
 
 This proof of concept demonstrates how a beverage distributor can predict cashflow 6 months ahead by connecting customer order behaviour to weather signals. Using SAP BDC as the source of truth for master data, we generate a realistic synthetic transaction history, train a forecasting model, and compare its predictions against known actuals — giving a clear, quantified view of forecast accuracy before any production investment is made.
