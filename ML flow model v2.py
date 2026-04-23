@@ -232,25 +232,22 @@ print(f"\nForecast rows: {len(forecast_pdf):,}  "
 
 # COMMAND ----------
 
-# Aggregate test-window actuals to same Monday-week grain
-actuals_raw = (
-    spark.table(FEATURE_TABLE)
-    .withColumn("SalesOrderDate", F.to_timestamp("SalesOrderDate"))
+# Read actuals directly from raw tables — material_lvl only covers training window
+# date_trunc('WEEK') in Spark truncates to Monday (ISO standard)
+actuals_spark = (
+    spark.table("h2b_dbx_salesorder.salesorder.salesorderitem")
+    .join(
+        spark.table("h2b_dbx_salesorder.salesorder.salesorder")
+             .select("SalesOrder", F.to_timestamp("SalesOrderDate").alias("SalesOrderDate")),
+        on="SalesOrder"
+    )
     .filter(F.col("SalesOrderDate") > TRAINING_END)
     .filter(F.col("Material").isin(FORECAST_MATERIALS))
-    .select("SalesOrderDate", "Material", "MaterialGroup", "Sum_OrderQuantity")
-    .toPandas()
+    .withColumn("SalesOrderDate",
+                F.date_trunc("WEEK", F.col("SalesOrderDate")).cast("date"))
+    .groupBy("SalesOrderDate", "MaterialGroup", "Material")
+    .agg(F.sum("OrderQuantity").alias("actual_qty"))
 )
-actuals_raw["SalesOrderDate"] = pd.to_datetime(actuals_raw["SalesOrderDate"])
-actuals_raw["week_start"]     = floor_to_monday(actuals_raw["SalesOrderDate"])
-
-actuals_weekly = (
-    actuals_raw
-    .groupby(["week_start", "Material", "MaterialGroup"], as_index=False)
-    .agg(actual_qty=("Sum_OrderQuantity", "sum"))
-    .rename(columns={"week_start": "SalesOrderDate"})
-)
-actuals_spark = spark.createDataFrame(actuals_weekly)
 
 forecast_spark = spark.createDataFrame(
     forecast_pdf.rename(columns={
